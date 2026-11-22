@@ -1,13 +1,12 @@
 
+from flask import Flask
 import os
 import json
+import html
 import urllib.request
 import urllib.error
 
-from flask import Flask
-
 app = Flask(__name__)
-
 
 @app.route("/")
 def home():
@@ -17,48 +16,70 @@ def home():
     <a href="/upstox-test">Test Upstox Connection</a>
     """
 
+@app.route("/callback")
+def callback():
+    return "Waiting for Upstox authorization."
 
 @app.route("/upstox-test")
 def upstox_test():
-    access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
+    token = os.getenv("UPSTOX_ACCESS_TOKEN")
 
-    if not access_token:
-        return "ERROR: UPSTOX_ACCESS_TOKEN is missing in Render.", 400
+    if not token:
+        return "<h2>ERROR: UPSTOX_ACCESS_TOKEN is missing in Render.</h2>", 500
 
     url = "https://api.upstox.com/v2/user/profile"
 
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         url,
         headers={
             "Accept": "application/json",
-            "Authorization": "Bearer " + access_token
+            "Authorization": "Bearer " + token
         },
         method="GET"
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=20) as response:
-            result = json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(request, timeout=20) as response:
+            data = json.loads(response.read().decode("utf-8"))
 
-        if result.get("status") == "success":
             return """
-            <h2>Upstox Connected Successfully!</h2>
+            <h1>Upstox Connected Successfully!</h1>
             <p>Your API connection is working.</p>
-            """
-
-        return "Upstox returned an unexpected response.", 502
+            <pre>{}</pre>
+            """.format(html.escape(json.dumps(data, indent=2)))
 
     except urllib.error.HTTPError as error:
-        if error.code == 401:
-            return "ERROR 401: Access token invalid or expired. Generate a fresh token.", 401
-        elif error.code == 403:
-            return "ERROR 403: Access is forbidden. Check API permissions.", 403
-        else:
-            return f"Upstox API returned HTTP error: {error.code}", 502
+        try:
+            body = json.loads(error.read().decode("utf-8"))
+            errors = body.get("errors") or []
 
-    except Exception:
-        return "Connection failed. Please check deployment and network settings.", 500
+            if errors:
+                detail = errors[0]
+                code = detail.get("errorCode") or detail.get("error_code") or "Not provided"
+                message = detail.get("message") or "No message provided"
+
+                return """
+                <h1>Upstox API Error</h1>
+                <p>HTTP Status: {}</p>
+                <p>Error Code: {}</p>
+                <p>Message: {}</p>
+                """.format(
+                    error.code,
+                    html.escape(str(code)),
+                    html.escape(str(message))
+                ), error.code
+
+            return "<h1>Upstox API Error</h1><p>HTTP Status: {}</p><p>No detailed error returned.</p>".format(error.code), error.code
+
+        except Exception:
+            return "<h1>Upstox API Error</h1><p>HTTP Status: {}</p><p>Could not read error details.</p>".format(error.code), error.code
+
+    except Exception as error:
+        return "<h1>Connection Failed</h1><p>{}</p>".format(
+            html.escape(str(error))
+        ), 500
 
 
 if __name__ == "__main__":
-    app.run()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
