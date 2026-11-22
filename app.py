@@ -24,3 +24,7 @@ def callback():
     <h2>SUMIT AI TRADING TERMINAL</h2>
     <p>Waiting for Upstox authorization.</p>
     """
+
+
+if __name__ == "__main__":
+    app.run()
