@@ -23,10 +23,7 @@ def upstox_test():
     access_token = os.getenv("UPSTOX_ACCESS_TOKEN")
 
     if not access_token:
-        return """
-        <h2>Access Token Missing</h2>
-        <p>Please add UPSTOX_ACCESS_TOKEN in Render Environment.</p>
-        """, 400
+        return "ERROR: UPSTOX_ACCESS_TOKEN is missing in Render.", 400
 
     url = "https://api.upstox.com/v2/user/profile"
 
@@ -34,32 +31,33 @@ def upstox_test():
         url,
         headers={
             "Accept": "application/json",
-            "Authorization": f"Bearer {access_token}"
+            "Authorization": "Bearer " + access_token
         },
         method="GET"
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
+        with urllib.request.urlopen(req, timeout=20) as response:
             result = json.loads(response.read().decode("utf-8"))
 
         if result.get("status") == "success":
             return """
             <h2>Upstox Connected Successfully!</h2>
             <p>Your API connection is working.</p>
-            <p>SUMIT AI TRADING TERMINAL is ready for the next step.</p>
             """
 
-        return "<h2>Upstox returned an unexpected response.</h2>", 502
+        return "Upstox returned an unexpected response.", 502
 
     except urllib.error.HTTPError as error:
-        return f"<h2>Upstox connection failed. HTTP status: {error.code}</h2>", 502
+        if error.code == 401:
+            return "ERROR 401: Access token invalid or expired. Generate a fresh token.", 401
+        elif error.code == 403:
+            return "ERROR 403: Access is forbidden. Check API permissions.", 403
+        else:
+            return f"Upstox API returned HTTP error: {error.code}", 502
 
     except Exception:
-        return """
-        <h2>Connection could not be completed.</h2>
-        <p>Please check your Render configuration and try again.</p>
-        """, 500
+        return "Connection failed. Please check deployment and network settings.", 500
 
 
 if __name__ == "__main__":
