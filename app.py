@@ -49,25 +49,23 @@ def upstox_test():
             """.format(html.escape(json.dumps(data, indent=2)))
 
     except urllib.error.HTTPError as error:
-        try:
-            body = json.loads(error.read().decode("utf-8"))
-            errors = body.get("errors") or []
+        raw_body = error.read().decode("utf-8", errors="replace")
 
-            if errors:
-                detail = errors[0]
-                code = detail.get("errorCode") or detail.get("error_code") or "Not provided"
-                message = detail.get("message") or "No message provided"
+        # Never display the access token
+        safe_body = raw_body.replace(token, "[REDACTED]")
 
-                return """
-                <h1>Upstox API Error</h1>
-                <p>HTTP Status: {}</p>
-                <p>Error Code: {}</p>
-                <p>Message: {}</p>
-                """.format(
-                    error.code,
-                    html.escape(str(code)),
-                    html.escape(str(message))
-                ), error.code
+        if not safe_body.strip():
+            safe_body = "Upstox returned an empty response body."
+
+        return """
+        <h1>Upstox Diagnostic Report</h1>
+        <p>HTTP Status: {}</p>
+        <pre>{}</pre>
+        """.format(
+            error.code,
+            html.escape(safe_body[:2000])
+        ), error.code
+
 
             return "<h1>Upstox API Error</h1><p>HTTP Status: {}</p><p>No detailed error returned.</p>".format(error.code), error.code
 
