@@ -21,7 +21,9 @@ INDEXES = {
 }
 
 OPTION_UNDERLYINGS = {
-    "NIFTY": "NSE_INDEX|Nifty 50"
+    "NIFTY": "NSE_INDEX|Nifty 50",
+    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
+    "SENSEX": "BSE_INDEX|SENSEX"
 }
 
 cache = {}
