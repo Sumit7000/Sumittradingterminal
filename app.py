@@ -1,1012 +1,924 @@
 
-from flask import Flask, jsonify, render_template_string, request
 import os
 import json
-import time
 import urllib.request
-import urllib.error
 import urllib.parse
+import urllib.error
 from datetime import datetime
+from flask import Flask, jsonify, request, render_template_string
 
 app = Flask(__name__)
 
-# -----------------------------------------
+# --------------------------------------------------
 # CONFIGURATION
-# -----------------------------------------
+# --------------------------------------------------
 
+UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+
+BASE_URL = "https://api.upstox.com/v2"
+
+# Index keys used for live market quotes and option chains.
 INDEXES = {
-    "NIFTY 50": "NSE_INDEX|Nifty 50",
-    "BANK NIFTY": "NSE_INDEX|Nifty Bank",
-    "SENSEX": "BSE_INDEX|SENSEX"
+    "NIFTY": {
+        "name": "NIFTY 50",
+        "key": "NSE_INDEX|Nifty 50"
+    },
+    "BANKNIFTY": {
+        "name": "BANK NIFTY",
+        "key": "NSE_INDEX|Nifty Bank"
+    },
+    "SENSEX": {
+        "name": "SENSEX",
+        "key": "BSE_INDEX|SENSEX"
+    }
 }
 
-OPTION_UNDERLYINGS = {
-    "NIFTY": "NSE_INDEX|Nifty 50",
-    "BANKNIFTY": "NSE_INDEX|Nifty Bank",
-    "SENSEX": "BSE_INDEX|SENSEX"
-}
 
-cache = {}
-
-
-# -----------------------------------------
-# UPSTOX API CONNECTION
-# -----------------------------------------
-
-class UpstoxAPIError(Exception):
-
-    def __init__(self, status, message):
-        self.status = status
-        self.message = message
-        super().__init__(message)
-
+# --------------------------------------------------
+# UPSTOX API HELPER
+# --------------------------------------------------
 
 def upstox_get(endpoint, params=None):
+    if not UPSTOX_ACCESS_TOKEN:
+        raise Exception("UPSTOX_ACCESS_TOKEN is missing in Render environment variables.")
 
-    token = os.getenv("UPSTOX_ACCESS_TOKEN")
-
-    if not token:
-        raise UpstoxAPIError(
-            500,
-            "UPSTOX_ACCESS_TOKEN is missing in Render."
-        )
-
-    url = "https://api.upstox.com" + endpoint
+    url = BASE_URL + endpoint
 
     if params:
         url += "?" + urllib.parse.urlencode(params)
 
-    req = urllib.request.Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "Authorization": "Bearer " + token,
-            "User-Agent": "SUMIT-AI-TRADING-TERMINAL/1.0"
-        },
-        method="GET"
-    )
+    headers = {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
+        "User-Agent": "SUMIT-AI-TRADING-TERMINAL/1.0"
+    }
+
+    req = urllib.request.Request(url, headers=headers, method="GET")
 
     try:
-
         with urllib.request.urlopen(req, timeout=20) as response:
-
-            return json.loads(
-                response.read().decode("utf-8")
-            )
+            return json.loads(response.read().decode("utf-8"))
 
     except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise Exception(f"Upstox HTTP {error.code}: {body[:700]}")
 
-        raw = error.read().decode(
-            "utf-8", errors="replace"
-        )
-
-        message = "Upstox API request failed."
-
-        try:
-            body = json.loads(raw)
-
-            errors = body.get("errors") or []
-
-            if errors:
-                message = errors[0].get(
-                    "message", message
-                )
-            else:
-                message = body.get(
-                    "detail",
-                    body.get("message", message)
-                )
-
-            if body.get("error_code") == 1010:
-                message = (
-                    "Cloudflare Error 1010: "
-                    "Upstox security blocked this request."
-                )
-
-        except Exception:
-            pass
-
-        # Never expose the access token
-        message = str(message).replace(
-            token, "[REDACTED]"
-        )
-
-        raise UpstoxAPIError(
-            error.code,
-            message
-        )
-
-    except urllib.error.URLError:
-        raise UpstoxAPIError(
-            503,
-            "Unable to reach Upstox servers."
-        )
+    except urllib.error.URLError as error:
+        raise Exception(f"Connection error: {error.reason}")
 
 
 def number(value, default=0):
-
     try:
-        return float(value)
+        return float(value) if value is not None else default
     except (TypeError, ValueError):
         return default
 
 
-# -----------------------------------------
-# MARKET DATA
-# -----------------------------------------
+def valid_symbol(symbol):
+    symbol = (symbol or "NIFTY").upper().strip()
 
-def get_market_quotes():
+    if symbol not in INDEXES:
+        raise ValueError("Invalid index. Select NIFTY, BANKNIFTY or SENSEX.")
 
-    instrument_keys = ",".join(
-        INDEXES.values()
-    )
+    return symbol
 
-    result = upstox_get(
-        "/v2/market-quote/quotes",
-        {
-            "instrument_key": instrument_keys
-        }
-    )
 
-    market_data = result.get("data", {})
+# --------------------------------------------------
+# LIVE MARKET DATA - ALL THREE INDICES
+# --------------------------------------------------
 
-    output = {}
+@app.route("/api/market")
+def market_data():
+    try:
+        keys = [item["key"] for item in INDEXES.values()]
 
-    for name, instrument_key in INDEXES.items():
+        result = upstox_get(
+            "/market-quote/quotes",
+            {"instrument_key": ",".join(keys)}
+        )
 
-        quote = None
+        raw_data = result.get("data", {})
+        market = {}
 
-        # Upstox may return keys with colon separators
-        expected_key = instrument_key.replace("|", ":")
+        for symbol, config in INDEXES.items():
+            key = config["key"]
 
-        quote = market_data.get(expected_key)
+            # Upstox returns quote objects keyed by instrument key.
+            quote = raw_data.get(key)
 
-        if quote is None:
-            quote = market_data.get(instrument_key)
+            if quote is None:
+                # Fallback in case the response key format differs.
+                quote = next(
+                    (
+                        value for value in raw_data.values()
+                        if value.get("instrument_token") == key
+                    ),
+                    None
+                )
 
-        # Fallback: match instrument token
-        if quote is None:
+            if not quote:
+                market[symbol] = {
+                    "name": config["name"],
+                    "available": False,
+                    "message": "Quote not returned by Upstox"
+                }
+                continue
 
-            for item in market_data.values():
+            ltp = number(quote.get("last_price"))
+            net_change = number(quote.get("net_change"))
 
-                if item.get("instrument_token") == instrument_key:
-                    quote = item
-                    break
+            ohlc = quote.get("ohlc") or {}
+            previous_close = number(ohlc.get("close"))
 
-        if quote is None:
+            percent = (
+                (net_change / previous_close) * 100
+                if previous_close else 0
+            )
 
-            output[name] = {
-                "error": "Quote not returned by Upstox"
+            market[symbol] = {
+                "name": config["name"],
+                "available": True,
+                "ltp": ltp,
+                "change": net_change,
+                "percent": percent,
+                "open": number(ohlc.get("open")),
+                "high": number(ohlc.get("high")),
+                "low": number(ohlc.get("low")),
+                "close": previous_close,
+                "volume": quote.get("volume", 0)
             }
 
-            continue
+        return jsonify({
+            "success": True,
+            "market": market,
+            "updated_at": datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+        })
 
-        ohlc = quote.get("ohlc", {})
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 500
 
-        last_price = number(
-            quote.get("last_price")
+
+# --------------------------------------------------
+# OPTION EXPIRIES - SELECTED INDEX
+# --------------------------------------------------
+
+@app.route("/api/option-expiries")
+def option_expiries():
+    try:
+        symbol = valid_symbol(request.args.get("symbol"))
+        instrument_key = INDEXES[symbol]["key"]
+
+        result = upstox_get(
+            "/option/contract",
+            {"instrument_key": instrument_key}
         )
 
-        previous_close = number(
-            ohlc.get("close")
-        )
+        contracts = result.get("data", [])
 
-        change = number(
-            quote.get("net_change")
-        )
+        expiries = sorted({
+            contract.get("expiry")
+            for contract in contracts
+            if contract.get("expiry")
+        })
 
-        change_percent = 0
+        return jsonify({
+            "success": True,
+            "symbol": symbol,
+            "name": INDEXES[symbol]["name"],
+            "expiries": expiries
+        })
 
-        if previous_close:
-            change_percent = (
-                change / previous_close
-            ) * 100
-
-        output[name] = {
-            "last_price": last_price,
-            "change": change,
-            "change_percent": round(
-                change_percent, 2
-            ),
-            "open": ohlc.get("open"),
-            "high": ohlc.get("high"),
-            "low": ohlc.get("low"),
-            "previous_close": previous_close
-        }
-
-    return output
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "error": str(error),
+            "expiries": []
+        }), 400
 
 
-# -----------------------------------------
-# OPTION EXPIRIES
-# -----------------------------------------
+# --------------------------------------------------
+# MAX PAIN CALCULATION
+# --------------------------------------------------
 
-def get_option_expiries():
+def calculate_max_pain(chain):
+    strikes = []
 
-    result = upstox_get(
-        "/v2/option/contract",
-        {
-            "instrument_key":
-                OPTION_UNDERLYINGS["NIFTY"]
-        }
-    )
+    for row in chain:
+        strike = number(row.get("strike_price"))
 
-    contracts = result.get("data", [])
+        call = row.get("call_options") or {}
+        put = row.get("put_options") or {}
 
-    expiries = sorted(set(
-        item.get("expiry")
-        for item in contracts
-        if item.get("expiry")
-    ))
+        call_data = call.get("market_data") or {}
+        put_data = put.get("market_data") or {}
 
-    return {
-        "expiries": expiries,
-        "total_contracts": len(contracts)
-    }
+        strikes.append({
+            "strike": strike,
+            "call_oi": number(call_data.get("oi")),
+            "put_oi": number(put_data.get("oi"))
+        })
 
-
-# -----------------------------------------
-# OPTION CHAIN
-# -----------------------------------------
-
-def calculate_max_pain(rows):
-
-    if not rows:
+    if not strikes:
         return None
 
-    strikes = [
-        number(row.get("strike_price"))
-        for row in rows
-    ]
-
-    min_pain = None
+    lowest_pain = None
     max_pain_strike = None
 
-    for settlement_price in strikes:
-
+    for settlement in [item["strike"] for item in strikes]:
         total_pain = 0
 
-        for row in rows:
-
-            strike = number(
-                row.get("strike_price")
+        for item in strikes:
+            # Call writers' intrinsic payout.
+            total_pain += (
+                max(0, settlement - item["strike"])
+                * item["call_oi"]
             )
 
-            call_oi = number(
-                row.get("call_options", {})
-                   .get("market_data", {})
-                   .get("oi")
+            # Put writers' intrinsic payout.
+            total_pain += (
+                max(0, item["strike"] - settlement)
+                * item["put_oi"]
             )
 
-            put_oi = number(
-                row.get("put_options", {})
-                   .get("market_data", {})
-                   .get("oi")
-            )
-
-            # Call writer intrinsic payout
-            call_pain = (
-                max(settlement_price - strike, 0)
-                * call_oi
-            )
-
-            # Put writer intrinsic payout
-            put_pain = (
-                max(strike - settlement_price, 0)
-                * put_oi
-            )
-
-            total_pain += call_pain + put_pain
-
-        if min_pain is None or total_pain < min_pain:
-
-            min_pain = total_pain
-            max_pain_strike = settlement_price
+        if lowest_pain is None or total_pain < lowest_pain:
+            lowest_pain = total_pain
+            max_pain_strike = settlement
 
     return max_pain_strike
 
 
-def get_option_chain(expiry):
+# --------------------------------------------------
+# OPTION CHAIN - NIFTY / BANK NIFTY / SENSEX
+# --------------------------------------------------
 
-    if not expiry:
-        raise UpstoxAPIError(
-            400, "Please select an expiry date."
-        )
+@app.route("/api/option-chain")
+def option_chain():
+    try:
+        symbol = valid_symbol(request.args.get("symbol"))
+        expiry = request.args.get("expiry", "").strip()
 
-    result = upstox_get(
-        "/v2/option/chain",
-        {
-            "instrument_key":
-                OPTION_UNDERLYINGS["NIFTY"],
-            "expiry_date": expiry
-        }
-    )
+        if not expiry:
+            return jsonify({
+                "success": False,
+                "error": "Please select an expiry date."
+            }), 400
 
-    raw_rows = result.get("data", [])
+        try:
+            datetime.strptime(expiry, "%Y-%m-%d")
+        except ValueError:
+            return jsonify({
+                "success": False,
+                "error": "Invalid expiry date format."
+            }), 400
 
-    rows = []
+        instrument_key = INDEXES[symbol]["key"]
 
-    total_call_oi = 0
-    total_put_oi = 0
-
-    spot_price = 0
-
-    for item in raw_rows:
-
-        call = item.get("call_options") or {}
-        put = item.get("put_options") or {}
-
-        call_market = call.get("market_data") or {}
-        put_market = put.get("market_data") or {}
-
-        call_greeks = call.get("option_greeks") or {}
-        put_greeks = put.get("option_greeks") or {}
-
-        call_oi = number(call_market.get("oi"))
-        put_oi = number(put_market.get("oi"))
-
-        call_prev_oi = number(
-            call_market.get("prev_oi")
-        )
-
-        put_prev_oi = number(
-            put_market.get("prev_oi")
-        )
-
-        total_call_oi += call_oi
-        total_put_oi += put_oi
-
-        spot_price = number(
-            item.get("underlying_spot_price"),
-            spot_price
-        )
-
-        rows.append({
-
-            "strike": number(
-                item.get("strike_price")
-            ),
-
-            "call": {
-                "ltp": number(call_market.get("ltp")),
-                "oi": call_oi,
-                "oi_change": call_oi - call_prev_oi,
-                "volume": number(call_market.get("volume")),
-                "iv": number(call_greeks.get("iv")),
-                "delta": number(call_greeks.get("delta")),
-                "bid": number(call_market.get("bid_price")),
-                "ask": number(call_market.get("ask_price"))
-            },
-
-            "put": {
-                "ltp": number(put_market.get("ltp")),
-                "oi": put_oi,
-                "oi_change": put_oi - put_prev_oi,
-                "volume": number(put_market.get("volume")),
-                "iv": number(put_greeks.get("iv")),
-                "delta": number(put_greeks.get("delta")),
-                "bid": number(put_market.get("bid_price")),
-                "ask": number(put_market.get("ask_price"))
+        result = upstox_get(
+            "/option/chain",
+            {
+                "instrument_key": instrument_key,
+                "expiry_date": expiry
             }
+        )
 
+        raw_chain = result.get("data", [])
+
+        if not raw_chain:
+            return jsonify({
+                "success": True,
+                "symbol": symbol,
+                "expiry": expiry,
+                "chain": [],
+                "message": "No option-chain data returned for this expiry."
+            })
+
+        chain = []
+        total_call_oi = 0
+        total_put_oi = 0
+        total_call_change = 0
+        total_put_change = 0
+
+        for row in raw_chain:
+            call = row.get("call_options") or {}
+            put = row.get("put_options") or {}
+
+            call_data = call.get("market_data") or {}
+            put_data = put.get("market_data") or {}
+
+            call_greeks = call.get("option_greeks") or {}
+            put_greeks = put.get("option_greeks") or {}
+
+            call_oi = number(call_data.get("oi"))
+            put_oi = number(put_data.get("oi"))
+
+            call_prev_oi = number(call_data.get("prev_oi"))
+            put_prev_oi = number(put_data.get("prev_oi"))
+
+            call_oi_change = call_oi - call_prev_oi
+            put_oi_change = put_oi - put_prev_oi
+
+            total_call_oi += call_oi
+            total_put_oi += put_oi
+
+            total_call_change += call_oi_change
+            total_put_change += put_oi_change
+
+            chain.append({
+                "strike": number(row.get("strike_price")),
+
+                "call": {
+                    "ltp": number(call_data.get("ltp")),
+                    "oi": call_oi,
+                    "oi_change": call_oi_change,
+                    "volume": number(call_data.get("volume")),
+                    "iv": number(call_greeks.get("iv")),
+                    "delta": number(call_greeks.get("delta")),
+                    "bid": number(call_data.get("bid_price")),
+                    "ask": number(call_data.get("ask_price"))
+                },
+
+                "put": {
+                    "ltp": number(put_data.get("ltp")),
+                    "oi": put_oi,
+                    "oi_change": put_oi_change,
+                    "volume": number(put_data.get("volume")),
+                    "iv": number(put_greeks.get("iv")),
+                    "delta": number(put_greeks.get("delta")),
+                    "bid": number(put_data.get("bid_price")),
+                    "ask": number(put_data.get("ask_price"))
+                }
+            })
+
+        chain.sort(key=lambda item: item["strike"])
+
+        pcr = (
+            total_put_oi / total_call_oi
+            if total_call_oi else 0
+        )
+
+        max_pain = calculate_max_pain(raw_chain)
+
+        spot = number(raw_chain[0].get("underlying_spot_price"))
+
+        return jsonify({
+            "success": True,
+            "symbol": symbol,
+            "name": INDEXES[symbol]["name"],
+            "expiry": expiry,
+            "spot": spot,
+            "pcr": pcr,
+            "max_pain": max_pain,
+            "total_call_oi": total_call_oi,
+            "total_put_oi": total_put_oi,
+            "call_oi_change": total_call_change,
+            "put_oi_change": total_put_change,
+            "chain": chain
         })
 
-    rows.sort(
-        key=lambda x: x["strike"]
-    )
-
-    pcr = 0
-
-    if total_call_oi:
-        pcr = total_put_oi / total_call_oi
-
-    max_pain = calculate_max_pain(raw_rows)
-
-    return {
-        "expiry": expiry,
-        "spot_price": spot_price,
-        "pcr": round(pcr, 3),
-        "total_call_oi": total_call_oi,
-        "total_put_oi": total_put_oi,
-        "max_pain": max_pain,
-        "total_strikes": len(rows),
-        "data": rows
-    }
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 400
 
 
-# -----------------------------------------
-# HTML DASHBOARD
-# -----------------------------------------
+# --------------------------------------------------
+# UPSTOX CONNECTION TEST
+# --------------------------------------------------
 
-DASHBOARD = r"""
+@app.route("/upstox-test")
+def upstox_test():
+    try:
+        result = upstox_get("/user/profile")
+
+        return jsonify({
+            "success": True,
+            "message": "Upstox connection successful",
+            "profile_status": result.get("status")
+        })
+
+    except Exception as error:
+        return jsonify({
+            "success": False,
+            "error": str(error)
+        }), 500
+
+
+# --------------------------------------------------
+# MAIN DASHBOARD
+# --------------------------------------------------
+
+HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
+    <title>SUMIT AI TRADING TERMINAL</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
 
-<meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { box-sizing: border-box; }
 
-<title>SUMIT AI TRADING TERMINAL</title>
+        body {
+            margin: 0;
+            padding: 18px;
+            background: #080d18;
+            color: #e8eefc;
+            font-family: Arial, sans-serif;
+        }
 
-<style>
+        h1 {
+            color: #42a5ff;
+            margin-bottom: 5px;
+        }
 
-* {
-    box-sizing: border-box;
-}
+        .subtitle {
+            color: #94a3b8;
+            margin-bottom: 22px;
+        }
 
-body {
-    margin: 0;
-    padding: 18px;
-    background: #0b1220;
-    color: white;
-    font-family: Arial, sans-serif;
-}
+        .cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 14px;
+        }
 
-header {
-    text-align: center;
-    margin-bottom: 25px;
-}
+        .card, .panel {
+            background: #111a2b;
+            border: 1px solid #24344e;
+            border-radius: 12px;
+            padding: 17px;
+        }
 
-header h1 {
-    color: #38bdf8;
-    font-size: 26px;
-}
+        .index-name {
+            color: #9eb3d1;
+            font-size: 14px;
+        }
 
-.subtitle {
-    color: #94a3b8;
-}
+        .price {
+            font-size: 27px;
+            font-weight: bold;
+            margin: 12px 0 5px;
+        }
 
-.section {
-    margin-top: 28px;
-}
+        .green { color: #22c98a; }
+        .red { color: #ff647c; }
+        .muted { color: #9aa9c0; }
 
-.section h2 {
-    color: #38bdf8;
-    font-size: 20px;
-}
+        .panel {
+            margin-top: 22px;
+            overflow: hidden;
+        }
 
-.grid {
-    display: grid;
-    grid-template-columns:
-        repeat(auto-fit, minmax(210px, 1fr));
-    gap: 15px;
-}
+        select, button {
+            background: #1b2b45;
+            border: 1px solid #365172;
+            color: white;
+            padding: 11px;
+            border-radius: 7px;
+            font-size: 15px;
+            margin: 5px 5px 10px 0;
+        }
 
-.card {
-    background: #172338;
-    border: 1px solid #263851;
-    border-radius: 12px;
-    padding: 18px;
-}
+        button {
+            background: #0879df;
+            border: none;
+            cursor: pointer;
+        }
 
-.card-title {
-    color: #94a3b8;
-    font-size: 14px;
-}
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+            gap: 10px;
+            margin: 15px 0;
+        }
 
-.price {
-    font-size: 29px;
-    font-weight: bold;
-    margin: 12px 0;
-}
+        .stat {
+            background: #19263b;
+            padding: 13px;
+            border-radius: 8px;
+        }
 
-.positive {
-    color: #22c55e;
-}
+        .stat-label {
+            color: #9eb3d1;
+            font-size: 12px;
+        }
 
-.negative {
-    color: #ef4444;
-}
+        .stat-value {
+            font-size: 19px;
+            font-weight: bold;
+            margin-top: 7px;
+        }
 
-.details {
-    color: #cbd5e1;
-    font-size: 13px;
-    line-height: 1.8;
-}
+        .table-wrap {
+            overflow-x: auto;
+            margin-top: 15px;
+        }
 
-.controls {
-    display: flex;
-    gap: 12px;
-    flex-wrap: wrap;
-    align-items: center;
-    margin: 15px 0;
-}
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            min-width: 850px;
+            font-size: 13px;
+        }
 
-select, button {
-    padding: 12px;
-    border-radius: 7px;
-    border: 1px solid #334155;
-    background: #172338;
-    color: white;
-    font-size: 14px;
-}
+        th, td {
+            padding: 10px 8px;
+            border-bottom: 1px solid #29364c;
+            text-align: right;
+            white-space: nowrap;
+        }
 
-button {
-    background: #0284c7;
-    border: none;
-    cursor: pointer;
-}
+        th {
+            background: #1b2b45;
+            color: #d7e6ff;
+        }
 
-.stats {
-    display: grid;
-    grid-template-columns:
-        repeat(auto-fit, minmax(150px, 1fr));
-    gap: 12px;
-    margin: 18px 0;
-}
+        th:nth-child(5), td:nth-child(5) {
+            text-align: center;
+            font-weight: bold;
+        }
 
-.stat {
-    background: #172338;
-    padding: 15px;
-    border-radius: 10px;
-}
+        .call-heading { color: #ff788a; }
+        .put-heading { color: #31d9a0; }
 
-.stat-label {
-    font-size: 12px;
-    color: #94a3b8;
-}
+        .message {
+            color: #ffc66d;
+            padding: 12px 0;
+        }
 
-.stat-value {
-    font-size: 21px;
-    margin-top: 8px;
-    font-weight: bold;
-}
-
-.table-wrap {
-    overflow-x: auto;
-    background: #172338;
-    border-radius: 10px;
-}
-
-table {
-    width: 100%;
-    min-width: 850px;
-    border-collapse: collapse;
-    font-size: 12px;
-    text-align: right;
-}
-
-th, td {
-    padding: 12px 9px;
-    border-bottom: 1px solid #334155;
-    white-space: nowrap;
-}
-
-th {
-    background: #24344d;
-    color: #bae6fd;
-}
-
-td.strike {
-    text-align: center;
-    font-weight: bold;
-    color: #facc15;
-}
-
-.atm {
-    background: #29415b;
-}
-
-.message {
-    color: #fbbf24;
-    padding: 12px;
-}
-
-.footer {
-    text-align: center;
-    color: #64748b;
-    font-size: 12px;
-    margin: 35px 0 15px;
-}
-
-@media(max-width:600px) {
-    body {
-        padding: 12px;
-    }
-
-    header h1 {
-        font-size: 21px;
-    }
-}
-
-</style>
+        .footer {
+            margin-top: 25px;
+            color: #788ba8;
+            font-size: 12px;
+        }
+    </style>
 </head>
 
 <body>
 
-<header>
     <h1>SUMIT AI TRADING TERMINAL</h1>
     <div class="subtitle">
-        Indian Market | Upstox API Dashboard
-    </div>
-</header>
-
-
-<div class="section">
-
-    <h2>LIVE MARKET OVERVIEW</h2>
-
-    <div class="grid" id="market">
-        <div class="card">Loading market data...</div>
+        Live Index Dashboard | Upstox API | Read-only
     </div>
 
-    <p class="subtitle" id="market-status">
-        Connecting to Upstox...
-    </p>
+    <h3>LIVE MARKET DATA</h3>
 
-</div>
+    <div class="cards">
 
+        <div class="card">
+            <div class="index-name">NIFTY 50</div>
+            <div class="price" id="nifty-price">Loading...</div>
+            <div id="nifty-change" class="muted">--</div>
+            <div class="muted" id="nifty-range"></div>
+        </div>
 
-<div class="section">
+        <div class="card">
+            <div class="index-name">BANK NIFTY</div>
+            <div class="price" id="banknifty-price">Loading...</div>
+            <div id="banknifty-change" class="muted">--</div>
+            <div class="muted" id="banknifty-range"></div>
+        </div>
 
-    <h2>NIFTY 50 OPTION CHAIN</h2>
+        <div class="card">
+            <div class="index-name">SENSEX</div>
+            <div class="price" id="sensex-price">Loading...</div>
+            <div id="sensex-change" class="muted">--</div>
+            <div class="muted" id="sensex-range"></div>
+        </div>
 
-    <div class="controls">
+    </div>
 
-        <label for="expiry">Select Expiry:</label>
+    <div class="panel">
 
-        <select id="expiry">
-            <option value="">Loading expiries...</option>
+        <h3>OPTION CHAIN ANALYSIS</h3>
+
+        <label for="symbol">Select Index:</label>
+
+        <select id="symbol" onchange="loadExpiries()">
+            <option value="NIFTY">NIFTY 50</option>
+            <option value="BANKNIFTY">BANK NIFTY</option>
+            <option value="SENSEX">SENSEX</option>
         </select>
 
-        <button onclick="loadOptionChain()">
-            Refresh Option Chain
-        </button>
+        <label for="expiry">Expiry:</label>
+
+        <select id="expiry">
+            <option value="">Select expiry</option>
+        </select>
+
+        <button onclick="loadOptionChain()">Load Option Chain</button>
+
+        <div id="status" class="message">
+            Select an index and expiry to load option-chain data.
+        </div>
+
+        <div class="stats">
+
+            <div class="stat">
+                <div class="stat-label">UNDERLYING SPOT</div>
+                <div class="stat-value" id="spot">--</div>
+            </div>
+
+            <div class="stat">
+                <div class="stat-label">PCR</div>
+                <div class="stat-value" id="pcr">--</div>
+            </div>
+
+            <div class="stat">
+                <div class="stat-label">MAX PAIN</div>
+                <div class="stat-value" id="maxpain">--</div>
+            </div>
+
+            <div class="stat">
+                <div class="stat-label">TOTAL CALL OI</div>
+                <div class="stat-value" id="calloi">--</div>
+            </div>
+
+            <div class="stat">
+                <div class="stat-label">TOTAL PUT OI</div>
+                <div class="stat-value" id="putoi">--</div>
+            </div>
+
+            <div class="stat">
+                <div class="stat-label">CALL OI CHANGE</div>
+                <div class="stat-value" id="callchange">--</div>
+            </div>
+
+            <div class="stat">
+                <div class="stat-label">PUT OI CHANGE</div>
+                <div class="stat-value" id="putchange">--</div>
+            </div>
+
+        </div>
+
+        <div class="table-wrap">
+            <table>
+                <thead>
+                    <tr>
+                        <th colspan="4" class="call-heading">CALL OPTIONS (CE)</th>
+                        <th rowspan="2">STRIKE</th>
+                        <th colspan="4" class="put-heading">PUT OPTIONS (PE)</th>
+                    </tr>
+                    <tr>
+                        <th>LTP</th>
+                        <th>OI</th>
+                        <th>OI CHANGE</th>
+                        <th>VOLUME</th>
+                        <th>VOLUME</th>
+                        <th>OI CHANGE</th>
+                        <th>OI</th>
+                        <th>LTP</th>
+                    </tr>
+                </thead>
+
+                <tbody id="chain-body">
+                    <tr>
+                        <td colspan="9" style="text-align:center">
+                            Option chain will appear here.
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
 
     </div>
 
-    <div id="option-status" class="message">
-        Loading expiry dates...
+    <div class="footer">
+        Data provided by Upstox API. Market data may be delayed or unavailable.
+        PCR and Max Pain are analytical indicators, not guaranteed predictions.
+        This terminal does not place orders.
+        <br><br>
+        Last market refresh: <span id="updated">--</span>
     </div>
-
-    <div class="stats">
-
-        <div class="stat">
-            <div class="stat-label">NIFTY SPOT</div>
-            <div class="stat-value" id="spot">—</div>
-        </div>
-
-        <div class="stat">
-            <div class="stat-label">TOTAL PCR</div>
-            <div class="stat-value" id="pcr">—</div>
-        </div>
-
-        <div class="stat">
-            <div class="stat-label">MAX PAIN (EST.)</div>
-            <div class="stat-value" id="maxpain">—</div>
-        </div>
-
-        <div class="stat">
-            <div class="stat-label">TOTAL STRIKES</div>
-            <div class="stat-value" id="strikes">—</div>
-        </div>
-
-    </div>
-
-    <div class="stats">
-
-        <div class="stat">
-            <div class="stat-label">TOTAL CALL OI</div>
-            <div class="stat-value" id="calloi">—</div>
-        </div>
-
-        <div class="stat">
-            <div class="stat-label">TOTAL PUT OI</div>
-            <div class="stat-value" id="putoi">—</div>
-        </div>
-
-    </div>
-
-    <div class="table-wrap">
-
-        <table>
-
-            <thead>
-                <tr>
-                    <th colspan="4">CALL OPTIONS (CE)</th>
-                    <th>STRIKE</th>
-                    <th colspan="4">PUT OPTIONS (PE)</th>
-                </tr>
-
-                <tr>
-                    <th>OI</th>
-                    <th>OI CHANGE</th>
-                    <th>LTP</th>
-                    <th>IV</th>
-                    <th>PRICE</th>
-                    <th>IV</th>
-                    <th>LTP</th>
-                    <th>OI CHANGE</th>
-                    <th>OI</th>
-                </tr>
-            </thead>
-
-            <tbody id="option-table">
-
-                <tr>
-                    <td colspan="9">
-                        Select an expiry to load option chain.
-                    </td>
-                </tr>
-
-            </tbody>
-
-        </table>
-
-    </div>
-
-</div>
-
-
-<div class="footer">
-    SUMIT AI TRADING TERMINAL |
-    Market data powered by Upstox
-    <br><br>
-    Read-only dashboard. No orders are placed.
-</div>
 
 
 <script>
 
-function formatNumber(value) {
-
-    if (value === null || value === undefined) {
-        return "—";
-    }
-
-    return Number(value).toLocaleString("en-IN", {
+function fmt(value) {
+    return Number(value || 0).toLocaleString("en-IN", {
         maximumFractionDigits: 2
     });
 }
 
+function compact(value) {
+    return Number(value || 0).toLocaleString("en-IN", {
+        maximumFractionDigits: 0
+    });
+}
+
+
+// -----------------------------------
+// LIVE MARKET CARDS
+// -----------------------------------
 
 async function loadMarket() {
-
-    const status = document.getElementById(
-        "market-status"
-    );
-
     try {
-
         const response = await fetch("/api/market");
+        const data = await response.json();
 
-        const result = await response.json();
-
-        if (!response.ok) {
-            throw new Error(result.error || "Market API failed");
+        if (!data.success) {
+            throw new Error(data.error || "Market data unavailable");
         }
 
-        let content = "";
+        const market = data.market;
 
-        for (const [name, item] of Object.entries(result.data)) {
+        const ids = {
+            NIFTY: "nifty",
+            BANKNIFTY: "banknifty",
+            SENSEX: "sensex"
+        };
 
-            if (item.error) {
+        for (const symbol of Object.keys(ids)) {
+            const id = ids[symbol];
+            const item = market[symbol];
 
-                content += `
-                    <div class="card">
-                        <div class="card-title">${name}</div>
-                        <p>${item.error}</p>
-                    </div>
-                `;
-
+            if (!item || !item.available) {
+                document.getElementById(id + "-price").textContent = "--";
+                document.getElementById(id + "-change").textContent =
+                    item ? item.message : "Data unavailable";
                 continue;
             }
 
-            const positive = item.change >= 0;
+            document.getElementById(id + "-price").textContent =
+                fmt(item.ltp);
 
-            const color = positive
-                ? "positive"
-                : "negative";
+            const change = Number(item.change);
+            const percent = Number(item.percent);
 
-            const sign = positive ? "+" : "";
+            const changeElement =
+                document.getElementById(id + "-change");
 
-            content += `
-                <div class="card">
+            changeElement.textContent =
+                (change >= 0 ? "+" : "") +
+                fmt(change) + " (" +
+                (percent >= 0 ? "+" : "") +
+                fmt(percent) + "%)";
 
-                    <div class="card-title">${name}</div>
+            changeElement.className =
+                change >= 0 ? "green" : "red";
 
-                    <div class="price">
-                        ${formatNumber(item.last_price)}
-                    </div>
-
-                    <div class="${color}">
-                        ${sign}${formatNumber(item.change)}
-                        (${sign}${item.change_percent}%)
-                    </div>
-
-                    <div class="details">
-                        Open: ${formatNumber(item.open)}<br>
-                        High: ${formatNumber(item.high)}<br>
-                        Low: ${formatNumber(item.low)}<br>
-                        Previous Close:
-                        ${formatNumber(item.previous_close)}
-                    </div>
-
-                </div>
-            `;
+            document.getElementById(id + "-range").textContent =
+                "O: " + fmt(item.open) +
+                " | H: " + fmt(item.high) +
+                " | L: " + fmt(item.low);
         }
 
-        document.getElementById(
-            "market"
-        ).innerHTML = content;
-
-        status.innerText =
-            "Last updated: " + result.updated_at;
+        document.getElementById("updated").textContent =
+            data.updated_at || "--";
 
     } catch (error) {
-
-        status.innerText = "Market Error: " + error.message;
+        document.getElementById("updated").textContent =
+            "Error: " + error.message;
     }
 }
 
 
+// -----------------------------------
+// LOAD EXPIRIES FOR SELECTED INDEX
+// -----------------------------------
+
 async function loadExpiries() {
+    const symbol = document.getElementById("symbol").value;
+    const expirySelect = document.getElementById("expiry");
+    const status = document.getElementById("status");
 
-    const select = document.getElementById("expiry");
+    expirySelect.innerHTML =
+        '<option value="">Loading expiries...</option>';
 
-    const status = document.getElementById(
-        "option-status"
-    );
+    document.getElementById("chain-body").innerHTML = "";
+
+    status.textContent = "Loading " + symbol + " expiries...";
 
     try {
-
         const response = await fetch(
-            "/api/option-expiries"
+            "/api/option-expiries?symbol=" +
+            encodeURIComponent(symbol)
         );
 
-        const result = await response.json();
+        const data = await response.json();
 
-        if (!response.ok) {
-            throw new Error(result.error || "Expiry API failed");
+        if (!data.success) {
+            throw new Error(data.error || "Unable to load expiries");
         }
 
-        select.innerHTML = "";
+        expirySelect.innerHTML =
+            '<option value="">Select expiry</option>';
 
-        if (!result.expiries.length) {
-
-            status.innerText =
-                "No option expiry dates returned by Upstox.";
-
+        if (!data.expiries || data.expiries.length === 0) {
+            status.textContent =
+                "No active expiries returned for " + symbol;
             return;
         }
 
-        result.expiries.forEach(function(date) {
-
+        data.expiries.forEach(function(expiry) {
             const option = document.createElement("option");
-
-            option.value = date;
-            option.textContent = date;
-
-            select.appendChild(option);
+            option.value = expiry;
+            option.textContent = expiry;
+            expirySelect.appendChild(option);
         });
 
-        status.innerText =
-            result.total_contracts +
-            " option contracts available.";
-
-        await loadOptionChain();
+        status.textContent =
+            data.name + " expiries loaded. Select an expiry.";
 
     } catch (error) {
+        expirySelect.innerHTML =
+            '<option value="">No expiries available</option>';
 
-        status.innerText =
-            "Expiry Error: " + error.message;
+        status.textContent = error.message;
     }
 }
 
 
+// -----------------------------------
+// LOAD SELECTED OPTION CHAIN
+// -----------------------------------
+
 async function loadOptionChain() {
-
-    const expiry = document.getElementById(
-        "expiry"
-    ).value;
-
-    const status = document.getElementById(
-        "option-status"
-    );
+    const symbol = document.getElementById("symbol").value;
+    const expiry = document.getElementById("expiry").value;
+    const status = document.getElementById("status");
 
     if (!expiry) {
-        status.innerText = "Please select an expiry.";
+        status.textContent = "Please select an expiry first.";
         return;
     }
 
-    status.innerText = "Loading NIFTY option chain...";
+    status.textContent = "Loading " + symbol + " option chain...";
 
     try {
+        const url =
+            "/api/option-chain?symbol=" +
+            encodeURIComponent(symbol) +
+            "&expiry=" +
+            encodeURIComponent(expiry);
 
-        const response = await fetch(
-            "/api/option-chain?expiry=" +
-            encodeURIComponent(expiry)
-        );
+        const response = await fetch(url);
+        const data = await response.json();
 
-        const result = await response.json();
-
-        if (!response.ok) {
-            throw new Error(result.error || "Option chain failed");
+        if (!data.success) {
+            throw new Error(data.error || "Option chain unavailable");
         }
 
-        document.getElementById("spot").innerText =
-            formatNumber(result.spot_price);
+        document.getElementById("spot").textContent =
+            fmt(data.spot);
 
-        document.getElementById("pcr").innerText =
-            formatNumber(result.pcr);
+        document.getElementById("pcr").textContent =
+            Number(data.pcr || 0).toFixed(2);
 
-        document.getElementById("maxpain").innerText =
-            formatNumber(result.max_pain);
+        document.getElementById("maxpain").textContent =
+            data.max_pain == null ? "--" : fmt(data.max_pain);
 
-        document.getElementById("strikes").innerText =
-            result.total_strikes;
+        document.getElementById("calloi").textContent =
+            compact(data.total_call_oi);
 
-        document.getElementById("calloi").innerText =
-            formatNumber(result.total_call_oi);
+        document.getElementById("putoi").textContent =
+            compact(data.total_put_oi);
 
-        document.getElementById("putoi").innerText =
-            formatNumber(result.total_put_oi);
+        document.getElementById("callchange").textContent =
+            compact(data.call_oi_change);
 
-        const tbody = document.getElementById(
-            "option-table"
-        );
+        document.getElementById("putchange").textContent =
+            compact(data.put_oi_change);
 
+        const tbody = document.getElementById("chain-body");
         tbody.innerHTML = "";
 
-        if (!result.data.length) {
+        if (!data.chain || data.chain.length === 0) {
+            tbody.innerHTML =
+                '<tr><td colspan="9">No option-chain rows returned.</td></tr>';
 
-            tbody.innerHTML = `
-                <tr>
-                    <td colspan="9">No option data available.</td>
-                </tr>
-            `;
-
+            status.textContent = data.message || "No chain data.";
             return;
         }
 
-        result.data.forEach(function(row) {
-
+        data.chain.forEach(function(row) {
             const tr = document.createElement("tr");
 
-            const isATM =
-                Math.abs(row.strike - result.spot_price) <
-                Math.abs(
-                    result.data.reduce(function(previous, current) {
-
-                        return Math.abs(
-                            current.strike - result.spot_price
-                        ) <
-                        Math.abs(
-                            previous.strike - result.spot_price
-                        )
-                        ? current
-                        : previous;
-
-                    }).strike - result.spot_price
-                ) + 0.001;
-
-            if (isATM) {
-                tr.className = "atm";
-            }
-
             const values = [
-
-                formatNumber(row.call.oi),
-                formatNumber(row.call.oi_change),
-                formatNumber(row.call.ltp),
-                formatNumber(row.call.iv),
-
-                formatNumber(row.strike),
-
-                formatNumber(row.put.iv),
-                formatNumber(row.put.ltp),
-                formatNumber(row.put.oi_change),
-                formatNumber(row.put.oi)
-
+                fmt(row.call.ltp),
+                compact(row.call.oi),
+                compact(row.call.oi_change),
+                compact(row.call.volume),
+                fmt(row.strike),
+                compact(row.put.volume),
+                compact(row.put.oi_change),
+                compact(row.put.oi),
+                fmt(row.put.ltp)
             ];
 
             values.forEach(function(value, index) {
-
                 const td = document.createElement("td");
-
                 td.textContent = value;
 
-                if (index === 4) {
-                    td.className = "strike";
+                if (index === 0 || index === 1 || index === 2 || index === 3) {
+                    td.className = "call-heading";
+                }
+
+                if (index === 5 || index === 6 || index === 7 || index === 8) {
+                    td.className = "put-heading";
                 }
 
                 tr.appendChild(td);
@@ -1015,39 +927,28 @@ async function loadOptionChain() {
             tbody.appendChild(tr);
         });
 
-        status.innerText =
-            "Option chain updated for expiry " + expiry;
+        status.textContent =
+            symbol + " option chain loaded successfully for " + expiry;
 
     } catch (error) {
+        status.textContent = error.message;
 
-        status.innerText =
-            "Option Chain Error: " + error.message;
+        document.getElementById("chain-body").innerHTML =
+            '<tr><td colspan="9">' +
+            error.message +
+            '</td></tr>';
     }
 }
 
 
-document.getElementById("expiry").addEventListener(
-    "change",
-    loadOptionChain
-);
+// -----------------------------------
+// INITIALIZE DASHBOARD
+// -----------------------------------
 
-
-// Initial loading
 loadMarket();
 loadExpiries();
 
-
-// Refresh market data every 15 seconds
 setInterval(loadMarket, 15000);
-
-// Refresh option chain every 30 seconds
-setInterval(function() {
-
-    if (document.getElementById("expiry").value) {
-        loadOptionChain();
-    }
-
-}, 30000);
 
 </script>
 
@@ -1056,212 +957,14 @@ setInterval(function() {
 """
 
 
-# -----------------------------------------
-# FLASK ROUTES
-# -----------------------------------------
-
 @app.route("/")
 def home():
-    return render_template_string(DASHBOARD)
+    return render_template_string(HTML)
 
 
-@app.route("/api/market")
-def market_api():
-
-    key = "market"
-    current_time = time.time()
-
-    if (
-        key in cache
-        and current_time - cache[key]["time"] < 10
-    ):
-
-        return jsonify(cache[key]["data"])
-
-    try:
-
-        data = get_market_quotes()
-
-        response = {
-            "status": "success",
-            "data": data,
-            "updated_at": datetime.now().strftime(
-                "%d-%m-%Y %I:%M:%S %p"
-            )
-        }
-
-        cache[key] = {
-            "time": current_time,
-            "data": response
-        }
-
-        return jsonify(response)
-
-    except UpstoxAPIError as error:
-
-        return jsonify({
-            "status": "error",
-            "error": error.message
-        }), error.status
-
-    except Exception:
-
-        app.logger.exception("Market API error")
-
-        return jsonify({
-            "status": "error",
-            "error": "Market data unavailable."
-        }), 500
-
-
-@app.route("/api/option-expiries")
-def option_expiries_api():
-
-    key = "option_expiries"
-    current_time = time.time()
-
-    if (
-        key in cache
-        and current_time - cache[key]["time"] < 300
-    ):
-
-        return jsonify(cache[key]["data"])
-
-    try:
-
-        data = get_option_expiries()
-
-        response = {
-            "status": "success",
-            "expiries": data["expiries"],
-            "total_contracts": data["total_contracts"]
-        }
-
-        cache[key] = {
-            "time": current_time,
-            "data": response
-        }
-
-        return jsonify(response)
-
-    except UpstoxAPIError as error:
-
-        return jsonify({
-            "status": "error",
-            "error": error.message
-        }), error.status
-
-    except Exception:
-
-        app.logger.exception("Expiry API error")
-
-        return jsonify({
-            "status": "error",
-            "error": "Unable to fetch option expiries."
-        }), 500
-
-
-@app.route("/api/option-chain")
-def option_chain_api():
-
-    expiry = request.args.get("expiry", "").strip()
-
-    if not expiry:
-        return jsonify({
-            "status": "error",
-            "error": "Expiry date is required."
-        }), 400
-
-    # Validate date format
-    try:
-        datetime.strptime(expiry, "%Y-%m-%d")
-    except ValueError:
-        return jsonify({
-            "status": "error",
-            "error": "Invalid expiry date format."
-        }), 400
-
-    key = "option_chain_" + expiry
-    current_time = time.time()
-
-    if (
-        key in cache
-        and current_time - cache[key]["time"] < 20
-    ):
-
-        return jsonify(cache[key]["data"])
-
-    try:
-
-        data = get_option_chain(expiry)
-
-        response = {
-            "status": "success",
-            **data
-        }
-
-        cache[key] = {
-            "time": current_time,
-            "data": response
-        }
-
-        return jsonify(response)
-
-    except UpstoxAPIError as error:
-
-        return jsonify({
-            "status": "error",
-            "error": error.message
-        }), error.status
-
-    except Exception:
-
-        app.logger.exception("Option chain API error")
-
-        return jsonify({
-            "status": "error",
-            "error": "Unable to fetch option chain."
-        }), 500
-
-
-@app.route("/upstox-test")
-def upstox_test():
-
-    try:
-
-        result = upstox_get(
-            "/v2/user/profile"
-        )
-
-        user = result.get("data", {})
-
-        return jsonify({
-            "status": "success",
-            "message": "Upstox Connected Successfully!",
-            "broker": user.get("broker"),
-            "is_active": user.get("is_active")
-        })
-
-    except UpstoxAPIError as error:
-
-        return jsonify({
-            "status": "error",
-            "http_status": error.status,
-            "message": error.message
-        }), error.status
-
-
-# -----------------------------------------
+# --------------------------------------------------
 # START APPLICATION
-# -----------------------------------------
+# --------------------------------------------------
 
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get("PORT", 10000)
-    )
-
-    app.run(
-        host="0.0.0.0",
-        port=port
-    )
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
