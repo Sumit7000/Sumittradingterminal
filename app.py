@@ -13,7 +13,9 @@ app = Flask(__name__)
 def home():
     return """
     <html>
-    <head><title>SUMIT AI TRADING TERMINAL</title></head>
+    <head>
+        <title>SUMIT AI TRADING TERMINAL</title>
+    </head>
     <body>
         <h1>SUMIT AI TRADING TERMINAL</h1>
         <h3>Application is running successfully!</h3>
@@ -36,7 +38,7 @@ def upstox_test():
     if not token:
         return """
         <h1>Configuration Error</h1>
-        <p>UPSTOX_ACCESS_TOKEN is missing in Render Environment Variables.</p>
+        <p>UPSTOX_ACCESS_TOKEN is missing in Render.</p>
         """, 500
 
     url = "https://api.upstox.com/v2/user/profile"
@@ -45,13 +47,18 @@ def upstox_test():
         url,
         headers={
             "Accept": "application/json",
-            "Authorization": "Bearer " + token
+            "Authorization": "Bearer " + token,
+            "User-Agent": "SUMIT-AI-TRADING-TERMINAL/1.0"
         },
         method="GET"
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
+
+        with urllib.request.urlopen(
+            request,
+            timeout=20
+        ) as response:
 
             raw_body = response.read().decode(
                 "utf-8", errors="replace"
@@ -62,10 +69,9 @@ def upstox_test():
             except json.JSONDecodeError:
                 data = {"response": raw_body}
 
-            # Remove token if it appears in response
-            safe_data = json.dumps(data, indent=2).replace(
-                token, "[REDACTED]"
-            )
+            safe_data = json.dumps(
+                data, indent=2
+            ).replace(token, "[REDACTED]")
 
             return """
             <html>
@@ -87,13 +93,32 @@ def upstox_test():
             "utf-8", errors="replace"
         )
 
-        # Hide access token from diagnostic output
         safe_body = raw_body.replace(
             token, "[REDACTED]"
         )
 
-        if not safe_body.strip():
-            safe_body = "Upstox returned an empty response body."
+        try:
+            error_data = json.loads(safe_body)
+        except json.JSONDecodeError:
+            error_data = {}
+
+        if (
+            error.code == 403
+            and error_data.get("error_code") == 1010
+        ):
+
+            return """
+            <html>
+            <body>
+                <h1>Cloudflare Error 1010</h1>
+                <h3>Access Denied by Upstox Security</h3>
+                <p>Cloudflare blocked this server request.</p>
+                <p>User-Agent was not accepted.</p>
+                <p>Adding a User-Agent does not guarantee access.</p>
+                <p>Contact Upstox support and request investigation.</p>
+            </body>
+            </html>
+            """, 403
 
         return """
         <html>
